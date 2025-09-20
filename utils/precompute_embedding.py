@@ -1,8 +1,8 @@
 from omegaconf import OmegaConf
 import argparse
 from diffusers import (
-    QwenImageInpaintPipeline,    # 인페인트 파이프라인: encode_prompt 사용
-    AutoencoderKLQwenImage,      # VAE 로드
+    QwenImageInpaintPipeline,    # Inpaint pipeline: use encode_prompt
+    AutoencoderKLQwenImage,      # Load VAE
 )
 import torch
 import os
@@ -15,7 +15,7 @@ import numpy as np
 # Device / dtype
 # -----------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-compute_dtype = torch.bfloat16  # 캐시 호환성 위해 고정(원하면 bf16/float16로 변경 가능)
+compute_dtype = torch.bfloat16  # Fixed for cache compatibility (can be changed to bf16/float16 if needed)
 
 # -----------------------
 # CLI
@@ -65,9 +65,9 @@ def resize_keep_ar_to_multiple_of_32(image: Image.Image, target_short: int | Non
 
 def load_mask_image(mask_path: str) -> Image.Image:
     """
-    마스크 규칙:
-    - 흰색(255) = 인페인트(채워 넣을) 영역
-    - 검은색(0) = 보존 영역
+    Mask rules:
+    - White (255) = inpaint (fill) area
+    - Black (0) = preserve area
     """
     m = Image.open(mask_path)
     if m.mode in ("RGBA", "LA"):
@@ -89,14 +89,14 @@ def mask_to_tensor(mask_img: Image.Image) -> torch.Tensor:
 # -----------------------
 def precompute_text_embeddings(cfg):
     """
-    저장 구조:
-    - 디스크: {output_dir}/cache/text_embs/{stem}.pt
+    Storage structure:
+    - Disk: {output_dir}/cache/text_embs/{stem}.pt
       => dict(prompt_embeds, prompt_embeds_mask)
-    - 메모리 반환: {stem: {...}, ...}
+    - Memory return: {stem: {...}, ...}
     """
     pipe = QwenImageInpaintPipeline.from_pretrained(
         cfg.pretrained_model_name_or_path,
-        transformer=None,  # 텍스트 인코더만 쓰도록 큰 weight 로드는 최소화
+        transformer=None,  # Minimize large weight loading by using only text encoder
         vae=None,
         torch_dtype=compute_dtype,
     ).to(device)
@@ -135,14 +135,14 @@ def precompute_text_embeddings(cfg):
         with torch.no_grad():
             try:
                 prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
-                    image=[img],                      # 구현에 따라 이미지 컨텍스트 허용
+                    image=[img],                      # Allow image context depending on implementation
                     prompt=[prompt_text],
                     device=pipe.device,
                     num_images_per_prompt=1,
                     max_sequence_length=max_seq_len,
                 )
             except TypeError:
-                # encode_prompt가 image 인자를 받지 않는 구현일 경우 fallback
+                # Fallback when encode_prompt implementation does not accept image argument
                 prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
                     prompt=[prompt_text],
                     device=pipe.device,
@@ -167,10 +167,10 @@ def precompute_text_embeddings(cfg):
 # -----------------------
 def precompute_image_and_mask_embeddings(cfg):
     """
-    저장 구조:
-    - 이미지 라텐트: {output_dir}/cache/image_latents/{stem}.pt
+    Storage structure:
+    - Image latents: {output_dir}/cache/image_latents/{stem}.pt
       => dict(latents, size(W,H), scaling_factor)
-    - 인페인트 마스크/마스킹 라텐트: {output_dir}/cache/masks/{stem}.pt
+    - Inpaint mask/masking latents: {output_dir}/cache/masks/{stem}.pt
       => dict(
             mask_image: [1,1,H,W],
             mask_latent: [1,1,h,w],
@@ -178,9 +178,9 @@ def precompute_image_and_mask_embeddings(cfg):
             size: (W,H)
          )
 
-    참고: masked_image_latents는 픽셀 공간에서
-          image_tensor * (1 - mask) + (-1 * mask) 로 “구멍”을 만들고
-          VAE encode 한 결과를 저장한다. (-1은 [-1,1] 정규화에서 ‘검정’)
+    Note: masked_image_latents creates "holes" in pixel space with
+          image_tensor * (1 - mask) + (-1 * mask) and stores
+          the result after VAE encoding. (-1 is 'black' in [-1,1] normalization)
     """
     vae = AutoencoderKLQwenImage.from_pretrained(
         cfg.pretrained_model_name_or_path,
@@ -205,9 +205,9 @@ def precompute_image_and_mask_embeddings(cfg):
         raise FileNotFoundError(f"img_dir not found: {img_dir}")
 
     mask_dir = getattr(cfg.data_config, "mask_dir", None)
-    img_size = getattr(cfg.data_config, "img_size", 1024)   # 짧은 변 기준 리사이즈
+    img_size = getattr(cfg.data_config, "img_size", 1024)   # Resize based on shorter side
 
-    # VAE 스케일/정규화 파라미터
+    # VAE scale/normalization parameters
     scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
     z_dim = getattr(vae.config, "z_dim", 16)
     latents_mean = torch.tensor(
@@ -230,16 +230,16 @@ def precompute_image_and_mask_embeddings(cfg):
         except Exception:
             continue
 
-        # 1) 리사이즈(32 배수)
+        # 1) Resize (multiple of 32)
         image = resize_keep_ar_to_multiple_of_32(image, img_size)
         W, H = image.size
 
-        # 2) 텐서 변환 [-1,1], [1,T,C,H,W]
+        # 2) Tensor conversion [-1,1], [1,T,C,H,W]
         image_tensor = pil_to_tensor(image).unsqueeze(0).to(device=device, dtype=vae.dtype)  # [1,C,H,W]
-        image_tensor = image_tensor.unsqueeze(2)  # [1,1,C,H,W] — QwenImage VAE 입력 형태에 맞춤
+        image_tensor = image_tensor.unsqueeze(2)  # [1,1,C,H,W] — Match QwenImage VAE input format
 
         with torch.no_grad():
-            # 3) VAE encode -> latents (원본)
+            # 3) VAE encode -> latents (original)
             posterior = vae.encode(image_tensor).latent_dist
             latents = posterior.sample()
             latents = (latents - latents_mean) * latents_std
@@ -247,7 +247,7 @@ def precompute_image_and_mask_embeddings(cfg):
 
         img_item = {
             "latents": latents,                  # [1,T,C,h,w]
-            "size": (W, H),                      # 리사이즈된 최종 해상도
+            "size": (W, H),                      # Final resolution after resize
             "scaling_factor": scaling_factor,
         }
 
@@ -256,9 +256,9 @@ def precompute_image_and_mask_embeddings(cfg):
         else:
             cached_img[stem] = img_item
 
-        # ----- 인페인트 마스크/마스킹 라텐트 -----
+        # ----- Inpaint mask/masking latents -----
         if mask_dir and os.path.isdir(mask_dir):
-            # 파일명 우선순위 탐색
+            # Search file names by priority
             mask_path = None
             for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
                 p = os.path.join(mask_dir, f"{stem}{ext}")
@@ -270,22 +270,22 @@ def precompute_image_and_mask_embeddings(cfg):
                 try:
                     raw_mask = load_mask_image(mask_path)
 
-                    # (A) 픽셀 공간 마스크(이미지 해상도)
+                    # (A) Pixel space mask (image resolution)
                     mask_img_resized = raw_mask.resize((W, H), Image.NEAREST)
                     mask_image_tensor = mask_to_tensor(mask_img_resized).to(device=device, dtype=vae.dtype)  # [1,1,H,W]
 
-                    # (B) 라텐트 해상도 마스크
-                    #   라텐트 해상도는 VAE 다운샘플(보통 1/8)
-                    #   먼저 원본 라텐트 크기를 알아야 하므로 위에서 만든 latents 기반으로 크기 추출
+                    # (B) Latent resolution mask
+                    #   Latent resolution is VAE downsampling (usually 1/8)
+                    #   Need to know original latent size first, so extract size based on latents created above
                     lat_h, lat_w = latents.shape[-2], latents.shape[-1]
                     mask_latent_img = mask_img_resized.resize((lat_w, lat_h), Image.NEAREST)
                     mask_latent_tensor = mask_to_tensor(mask_latent_img).to(device=device, dtype=vae.dtype)  # [1,1,latH,latW]
 
-                    # (C) masked image 만들기 (픽셀 공간)
-                    #   구멍(hole)은 -1(정규화 공간에서 검정)로 채움.
+                    # (C) Create masked image (pixel space)
+                    #   Fill holes with -1 (black in normalized space).
                     #   image_tensor: [1,1,C,H,W], mask_image_tensor: [1,1,H,W]
                     hole = (-1.0) * mask_image_tensor  # [1,1,H,W]
-                    comp = image_tensor * (1.0 - mask_image_tensor) + hole  # 브로드캐스트로 채워짐
+                    comp = image_tensor * (1.0 - mask_image_tensor) + hole  # Filled by broadcasting
 
                     with torch.no_grad():
                         masked_post = vae.encode(comp).latent_dist
@@ -302,10 +302,10 @@ def precompute_image_and_mask_embeddings(cfg):
 
                     if cfg.save_cache_on_disk:
                         torch.save(mask_item, os.path.join(mask_cache_dir, f"{stem}.pt"))
-                    # 필요시 메모리 캐시도 추가 가능
+                    # Memory cache can also be added if needed
 
                 except Exception as e:
-                    # 마스크 처리 실패 시 건너뜀
+                    # Skip when mask processing fails
                     pass
 
     return cached_img
@@ -317,7 +317,7 @@ def main():
     config_path = parse_args()
     cfg = OmegaConf.load(config_path)
 
-    # 필수 키 확인
+    # Check required keys
     for k in ["pretrained_model_name_or_path", "output_dir", "data_config"]:
         if k not in cfg:
             raise ValueError(f"Config missing required key: {k}")
@@ -331,7 +331,7 @@ def main():
     if "save_cache_on_disk" not in cfg:
         cfg.save_cache_on_disk = True
 
-    # 캐시 생성
+    # Create cache
     _ = precompute_text_embeddings(cfg)
     _ = precompute_image_and_mask_embeddings(cfg)
 

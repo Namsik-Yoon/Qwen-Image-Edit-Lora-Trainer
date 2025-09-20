@@ -12,25 +12,25 @@ def _load_pt(path: str):
 
 class PrecomputedInpaintDataset(Dataset):
     """
-    반환:
+    Returns:
       pixel_latents (C,T,h,w), prompt_embeds (L,D), prompt_embeds_mask (L,),
       control_latents (C,T,h,w), mask_latent (1,h,w)
     """
     def __init__(
         self,
         img_dir: str,
-        # 선택 인자: 없으면 output_dir로부터 추론
+        # Optional args: infer from output_dir if not provided
         text_cache_dir: str | None = None,
         image_latents_dir: str | None = None,
         masks_cache_dir: str | None = None,
-        # 추론에 필요한 base 경로
+        # Base path needed for inference
         output_dir: str | None = None,
-        cache_dir: str | None = None,  # 직접 지정 시 우선
+        cache_dir: str | None = None,  # Priority when directly specified
         caption_dropout_rate: float = 0.0,
         use_infinite: bool = True,
-        **unused,   # train_batch_size, num_workers, img_size 등 무시
+        **unused,   # Ignore train_batch_size, num_workers, img_size etc.
     ):
-        # ---- 캐시 디렉토리 자동 추론 ----
+        # ---- Auto-infer cache directories ----
         if cache_dir is None:
             if output_dir is None and (text_cache_dir is None or image_latents_dir is None or masks_cache_dir is None):
                 raise ValueError(
@@ -55,7 +55,7 @@ class PrecomputedInpaintDataset(Dataset):
         self.caption_dropout_rate = float(caption_dropout_rate)
         self.use_infinite = use_infinite
 
-        # ---- 유효 stem 수집 ----
+        # ---- Collect valid stems ----
         stems = [os.path.splitext(n)[0] for n in os.listdir(self.image_latents_dir) if n.lower().endswith(".pt")]
         stems.sort()
         valid = []
@@ -137,20 +137,20 @@ class PrecomputedInpaintDataset(Dataset):
 
 def loader(**cfg):
     """
-    cfg 예:
+    cfg example:
       {
         "img_dir": ".../images",
-        # (없어도 됨) 아래가 없으면 output_dir로 추론:
+        # (Optional) Infer from output_dir if below are not provided:
         "text_cache_dir": ".../cache/text_embs",
         "image_latents_dir": ".../cache/image_latents",
         "masks_cache_dir": ".../cache/masks",
-        # dataloader 옵션:
+        # dataloader options:
         "train_batch_size": 1,
         "num_workers": 0,
-        # dataset 옵션:
+        # dataset options:
         "caption_dropout_rate": 0.1,
         "use_infinite": True,
-        # (없어도 됨) output_dir: 추론용
+        # (Optional) output_dir: for inference
         "output_dir": ".../outputs/exp1"
       }
     """
@@ -162,9 +162,9 @@ def loader(**cfg):
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=min(num_workers, 2),  # CPU OOM 방지: 0~2 권장
+        num_workers=min(num_workers, 2),  # Prevent CPU OOM: recommend 0~2
         shuffle=True,
-        pin_memory=False,                 # CPU 타이트 → False
+        pin_memory=False,                 # CPU tight → False
         prefetch_factor=1,
         persistent_workers=False,
         drop_last=True,

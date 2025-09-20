@@ -28,7 +28,7 @@ import datasets
 import diffusers
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers import (
-    QwenImageInpaintPipeline as QIPipe,   # [CHANGED] inpaint 파이프라인
+    QwenImageInpaintPipeline as QIPipe,
     QwenImageTransformer2DModel,
 )
 from diffusers.optimization import get_scheduler
@@ -47,7 +47,7 @@ from optimum.quanto import quantize, qfloat8, freeze
 import bitsandbytes as bnb
 
 from omegaconf import OmegaConf
-from utils.dataset import loader   # [ASSUME] 배치에 precomputed 텐서들을 반환하도록 구현됨
+from utils.dataset import loader
 
 logger = get_logger(__name__, log_level="INFO")
 logging.basicConfig(
@@ -161,7 +161,7 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
 
     # -------------------------
-    # 모델 & LoRA
+    # Model & LoRA
     # -------------------------
     weight_dtype = torch.bfloat16 if args.mixed_precision in ("bf16", "fp16") else torch.float32
     offload_dir = os.path.join(args.output_dir, "offload")
@@ -177,7 +177,6 @@ def main():
         offload_folder=offload_dir,
     )
 
-    # (선택) 마지막 K개 블록 양자화
     if args.quantize:
         device = accelerator.device
         all_blocks = list(flux_transformer.transformer_blocks)
@@ -204,7 +203,7 @@ def main():
 
     flux_transformer.add_adapter(lora_config)
 
-    # 스케줄러
+    # Scheduler
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
@@ -221,7 +220,7 @@ def main():
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    # 학습 세팅
+    # Training settings
     flux_transformer.requires_grad_(False)
     flux_transformer.train()
     for n, p in flux_transformer.named_parameters():
@@ -244,9 +243,9 @@ def main():
         )
 
     # -------------------------
-    # DataLoader (캐시 기반)
-    # loader 가 반드시 다음 텐서들을 배치로 반환하도록 해주세요:
-    # pixel_latents:           (B, z, T, H', W')   # [NOTE] 이미 μ/σ 정규화된 라텐트
+    # DataLoader (cache-based)
+    # Please ensure loader returns the following tensors in batches:
+    # pixel_latents:           (B, z, T, H', W')   # [NOTE] Already μ/σ normalized latents
     # prompt_embeds:           (B, L, D)
     # prompt_embeds_mask:      (B, L) (int/bool)
     # control_latents:         (B, z, T, H', W')   # masked_image_latents
@@ -283,21 +282,21 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(flux_transformer):
                 # -------------------------
-                # 배치 언팩 (모두 캐시 텐서)
+                # Unpack batch (all cached tensors)
                 # -------------------------
                 pixel_latents, prompt_embeds, prompt_embeds_mask, control_latents, mask_latent = batch
                 del batch
 
-                # dtype/device 정리
+                # dtype/device cleanup
                 pixel_latents      = pixel_latents.to(device=accelerator.device, dtype=weight_dtype)       # (B,z,T,H',W')
                 control_latents    = control_latents.to(device=accelerator.device, dtype=weight_dtype)     # (B,z,T,H',W')
                 mask_latent        = mask_latent.to(device=accelerator.device, dtype=weight_dtype)         # (B,1,H',W')
                 prompt_embeds      = prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)       # (B,L,D)
                 prompt_embeds_mask = prompt_embeds_mask.to(device=accelerator.device)                      # (B,L) int/bool
 
-                # [IMPORTANT] precompute 단계에서 이미 μ/σ 정규화 완료된 latents 가정 → 추가 정규화 없음
+                # [IMPORTANT] Assume latents are already μ/σ normalized in precompute step → no additional normalization
 
-                # 노이즈 샘플/타임스텝
+                # Noise sample/timestep
                 bsz = pixel_latents.shape[0]
                 noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
                 u = compute_density_for_timestep_sampling(
@@ -331,10 +330,10 @@ def main():
 
                 packed_input = torch.cat([packed_noisy, packed_control], dim=1)
 
-                # 텍스트 길이
+                # Text length
                 txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
 
-                # 전방향
+                # Forward pass
                 model_pred = flux_transformer(
                     hidden_states=packed_input,
                     timestep=timesteps / 1000,
@@ -355,8 +354,8 @@ def main():
                     vae_scale_factor=1,
                 )
 
-                # 손실 가중(인페인트)
-                # mask_latent: (B,1,H',W') 이미 라텐트 해상도
+                # Loss weighting (inpaint)
+                # mask_latent: (B,1,H',W') already latent resolution
                 alpha_fg  = float(getattr(args, "mask_fg_boost", 2.0))
                 lambda_bg = float(getattr(args, "mask_bg_scale", 1.0))
                 id_lambda = float(getattr(args, "lambda_identity_bg", 0.0))
@@ -376,7 +375,7 @@ def main():
                     bg_loss = torch.mean((diff**2) * bg_mask.float())
                     loss = loss + id_lambda * bg_loss
 
-                # logging(간단)
+                # logging (simple)
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 if accelerator.is_main_process and global_step % 10 == 0:
                     accelerator.log({
@@ -399,7 +398,7 @@ def main():
                     accelerator.log({"train_loss": avg_loss.item()}, step=global_step)
                     log_comprehensive_metrics(accelerator, global_step, flux_transformer)
 
-                # 저장 & (선택)인퍼런스
+                # Save & (optional) inference
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         if args.checkpoints_total_limit is not None:
@@ -414,7 +413,7 @@ def main():
                     os.makedirs(save_path, exist_ok=True)
                     unwrapped = unwrap_model(flux_transformer)
                     lora_state = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped))
-                    # [CHANGED] Inpaint 파이프라인의 save_lora_weights 사용
+                    # [CHANGED] Use save_lora_weights of Inpaint pipeline
                     QIPipe.save_lora_weights(save_path, lora_state, safe_serialization=True)
                     logger.info(f"Saved LoRA weights to {save_path}")
 
