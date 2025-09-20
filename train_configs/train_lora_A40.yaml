@@ -1,7 +1,7 @@
 pretrained_model_name_or_path: Qwen/Qwen-Image-Edit
 data_config:
   train_batch_size: 1
-  num_workers: 16
+  num_workers: 1
   img_size: 1024
   caption_dropout_rate: 0.1
   img_dir: /workspace/Qwen-Image-Edit-Lora-Trainer/datasets/images
@@ -11,8 +11,8 @@ data_config:
   caption_type: txt
 report_to: tensorboard
 train_batch_size: 1
-output_dir: /workspace/Qwen-Image-Edit-Lora-Trainer/outputs
-max_train_steps: 5000
+output_dir: /workspace/Qwen-Image-Edit-Lora-Trainer/outputs/exp2
+max_train_steps: 1000
 learning_rate: 2e-4
 lr_scheduler: constant
 lr_warmup_steps: 10
@@ -23,7 +23,7 @@ adam_epsilon: 1e-8
 max_grad_norm: 1.0
 logging_dir: logs
 mixed_precision: "bf16"
-checkpointing_steps: 100
+checkpointing_steps: 2
 checkpoints_total_limit: 50
 tracker_project_name: lora_edit
 resume_from_checkpoint: latest
@@ -34,7 +34,7 @@ precompute_image_embeddings: true
 quantize: true
 adam8bit: true
 save_cache_on_disk: true
-quantize_last_k_blocks: 8 
+quantize_last_k_blocks: 16
 mask_fg_boost: 2.0           # Edit area (green) weight multiplier
 mask_bg_scale: 1.0           # Background weight multiplier
 lambda_identity_bg: 0.0      # Background identity regularization strength (0 to turn off)
