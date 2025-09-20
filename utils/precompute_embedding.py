@@ -1,7 +1,7 @@
 from omegaconf import OmegaConf
 import argparse
 from diffusers import (
-    QwenImageEditPipeline,       # 텍스트 임베딩용 encode_prompt 사용
+    QwenImageInpaintPipeline,    # 인페인트 파이프라인: encode_prompt 사용
     AutoencoderKLQwenImage,      # VAE 로드
 )
 import torch
@@ -66,16 +66,13 @@ def resize_keep_ar_to_multiple_of_32(image: Image.Image, target_short: int | Non
 def load_mask_image(mask_path: str) -> Image.Image:
     """
     마스크 규칙:
-    - 흰색(255) = 편집/인페인트 영역
+    - 흰색(255) = 인페인트(채워 넣을) 영역
     - 검은색(0) = 보존 영역
     """
     m = Image.open(mask_path)
-    # 다양한 포맷 지원: RGBA, L, RGB 등
     if m.mode in ("RGBA", "LA"):
-        # alpha 채널 있으면 alpha를 마스크로 사용
         m = m.split()[-1]
     elif m.mode != "L":
-        # RGB 등은 그레이스케일로 변환
         m = m.convert("L")
     return m
 
@@ -88,7 +85,7 @@ def mask_to_tensor(mask_img: Image.Image) -> torch.Tensor:
     return ten
 
 # -----------------------
-# Precompute text embeddings (QwenImageEdit encode_prompt)
+# Precompute text embeddings (QwenImageInpaint encode_prompt)
 # -----------------------
 def precompute_text_embeddings(cfg):
     """
@@ -97,7 +94,7 @@ def precompute_text_embeddings(cfg):
       => dict(prompt_embeds, prompt_embeds_mask)
     - 메모리 반환: {stem: {...}, ...}
     """
-    pipe = QwenImageEditPipeline.from_pretrained(
+    pipe = QwenImageInpaintPipeline.from_pretrained(
         cfg.pretrained_model_name_or_path,
         transformer=None,  # 텍스트 인코더만 쓰도록 큰 weight 로드는 최소화
         vae=None,
@@ -130,21 +127,29 @@ def precompute_text_embeddings(cfg):
 
         img_path = os.path.join(img_dir, img_name)
         try:
-            # 일부 구현은 encode_prompt에서 이미지 컨텍스트를 사용하므로 함께 전달
             img = Image.open(img_path).convert("RGB")
         except Exception:
             continue
 
         prompt_text = load_text(txt_path)
         with torch.no_grad():
-            # 반환: (prompt_embeds, prompt_embeds_mask)
-            prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
-                image=[img],                      # 컨텍스트 참조 가능(모델 구현에 따라)
-                prompt=[prompt_text],           # 배치 가능
-                device=pipe.device,
-                num_images_per_prompt=1,
-                max_sequence_length=max_seq_len,
-            )
+            try:
+                prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+                    image=[img],                      # 구현에 따라 이미지 컨텍스트 허용
+                    prompt=[prompt_text],
+                    device=pipe.device,
+                    num_images_per_prompt=1,
+                    max_sequence_length=max_seq_len,
+                )
+            except TypeError:
+                # encode_prompt가 image 인자를 받지 않는 구현일 경우 fallback
+                prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+                    prompt=[prompt_text],
+                    device=pipe.device,
+                    num_images_per_prompt=1,
+                    max_sequence_length=max_seq_len,
+                )
+
             item = {
                 "prompt_embeds": prompt_embeds[0].to("cpu").contiguous(),
                 "prompt_embeds_mask": prompt_embeds_mask[0].to("cpu").contiguous(),
@@ -158,15 +163,24 @@ def precompute_text_embeddings(cfg):
     return cached
 
 # -----------------------
-# Precompute image embeddings (VAE latents) + optional inpaint masks
+# Precompute image embeddings (VAE latents) + inpaint masks & masked_image_latents
 # -----------------------
 def precompute_image_and_mask_embeddings(cfg):
     """
     저장 구조:
     - 이미지 라텐트: {output_dir}/cache/image_latents/{stem}.pt
       => dict(latents, size(W,H), scaling_factor)
-    - (선택) 마스크: {output_dir}/cache/masks/{stem}.pt
-      => dict(mask_image: [1,1,H,W], mask_latent: [1,1,H/8,W/8], size(W,H))
+    - 인페인트 마스크/마스킹 라텐트: {output_dir}/cache/masks/{stem}.pt
+      => dict(
+            mask_image: [1,1,H,W],
+            mask_latent: [1,1,h,w],
+            masked_image_latents: [1,T,C,h,w],
+            size: (W,H)
+         )
+
+    참고: masked_image_latents는 픽셀 공간에서
+          image_tensor * (1 - mask) + (-1 * mask) 로 “구멍”을 만들고
+          VAE encode 한 결과를 저장한다. (-1은 [-1,1] 정규화에서 ‘검정’)
     """
     vae = AutoencoderKLQwenImage.from_pretrained(
         cfg.pretrained_model_name_or_path,
@@ -175,20 +189,16 @@ def precompute_image_and_mask_embeddings(cfg):
     ).to(device)
     vae.eval()
     vae.enable_tiling()
-    
-    img_cache_dir = None
-    mask_cache_dir = None
-    cached_img = None
 
     if cfg.save_cache_on_disk:
         img_cache_dir = os.path.join(cfg.output_dir, "cache", "image_latents")
+        mask_cache_dir = os.path.join(cfg.output_dir, "cache", "masks")
         os.makedirs(img_cache_dir, exist_ok=True)
-        # 마스크 캐시 디렉토리 (선택)
-        if hasattr(cfg.data_config, "mask_dir") and os.path.isdir(cfg.data_config.mask_dir):
-            mask_cache_dir = os.path.join(cfg.output_dir, "cache", "masks")
-            os.makedirs(mask_cache_dir, exist_ok=True)
+        os.makedirs(mask_cache_dir, exist_ok=True)
     else:
-        cached_img = {}
+        img_cache_dir = mask_cache_dir = None
+
+    cached_img = {} if not cfg.save_cache_on_disk else None
 
     img_dir = cfg.data_config.img_dir
     if not os.path.isdir(img_dir):
@@ -196,11 +206,22 @@ def precompute_image_and_mask_embeddings(cfg):
 
     mask_dir = getattr(cfg.data_config, "mask_dir", None)
     img_size = getattr(cfg.data_config, "img_size", 1024)   # 짧은 변 기준 리사이즈
+
+    # VAE 스케일/정규화 파라미터
     scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+    z_dim = getattr(vae.config, "z_dim", 16)
+    latents_mean = torch.tensor(
+        getattr(vae.config, "latents_mean", [0.0] * z_dim),
+        device=device, dtype=vae.dtype
+    ).view(1, z_dim, 1, 1, 1)
+    latents_std = 1.0 / torch.tensor(
+        getattr(vae.config, "latents_std", [1.0] * z_dim),
+        device=device, dtype=vae.dtype
+    ).view(1, z_dim, 1, 1, 1)
 
     image_names = list_images(img_dir)
 
-    for img_name in tqdm(image_names, desc="Precompute Image (VAE) Latents"):
+    for img_name in tqdm(image_names, desc="Precompute Image/Mask (VAE) Latents"):
         stem = os.path.splitext(img_name)[0]
         img_path = os.path.join(img_dir, img_name)
 
@@ -214,22 +235,18 @@ def precompute_image_and_mask_embeddings(cfg):
         W, H = image.size
 
         # 2) 텐서 변환 [-1,1], [1,T,C,H,W]
-        image_tensor = pil_to_tensor(image).unsqueeze(0).to(device=device, dtype=vae.dtype)
-        image_tensor = image_tensor.unsqueeze(2)
+        image_tensor = pil_to_tensor(image).unsqueeze(0).to(device=device, dtype=vae.dtype)  # [1,C,H,W]
+        image_tensor = image_tensor.unsqueeze(2)  # [1,1,C,H,W] — QwenImage VAE 입력 형태에 맞춤
 
-        # 3) VAE encode -> latents
         with torch.no_grad():
-            posterior = vae.encode(image_tensor.to(vae.dtype)).latent_dist
+            # 3) VAE encode -> latents (원본)
+            posterior = vae.encode(image_tensor).latent_dist
             latents = posterior.sample()
-
-            # Qwen-Image 표준 정규화
-            latents_mean = torch.tensor(vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(1, vae.config.z_dim, 1, 1, 1)
-            latents_std  = (1.0 / torch.tensor(vae.config.latents_std, device=latents.device, dtype=latents.dtype)).view(1, vae.config.z_dim, 1, 1, 1)
             latents = (latents - latents_mean) * latents_std
             latents = latents.to("cpu").contiguous()
 
         img_item = {
-            "latents": latents,                  # [1,T,C,H/8,W/8]
+            "latents": latents,                  # [1,T,C,h,w]
             "size": (W, H),                      # 리사이즈된 최종 해상도
             "scaling_factor": scaling_factor,
         }
@@ -239,36 +256,56 @@ def precompute_image_and_mask_embeddings(cfg):
         else:
             cached_img[stem] = img_item
 
-        # ----- (옵션) 인페인트 마스크 캐시 -----
+        # ----- 인페인트 마스크/마스킹 라텐트 -----
         if mask_dir and os.path.isdir(mask_dir):
-            mask_path = os.path.join(mask_dir, f"{stem}.png")
-            if not os.path.isfile(mask_path):
-                mask_path = os.path.join(mask_dir, f"{stem}.jpg")
-            if not os.path.isfile(mask_path):
-                mask_path = os.path.join(mask_dir, f"{stem}.jpeg")
+            # 파일명 우선순위 탐색
+            mask_path = None
+            for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                p = os.path.join(mask_dir, f"{stem}{ext}")
+                if os.path.isfile(p):
+                    mask_path = p
+                    break
 
-            if os.path.isfile(mask_path):
+            if mask_path:
                 try:
                     raw_mask = load_mask_image(mask_path)
-                    # 이미지와 동일 해상도로 리사이즈 (픽셀-공간 마스크)
-                    mask_img_resized = raw_mask.resize((W, H), Image.NEAREST)
-                    mask_image_tensor = mask_to_tensor(mask_img_resized)  # [1,1,H,W], float 0~1
 
-                    # 라텐트 해상도(1/8)로 다운샘플링한 마스크
-                    lat_h, lat_w = latents.shape[-2:]
+                    # (A) 픽셀 공간 마스크(이미지 해상도)
+                    mask_img_resized = raw_mask.resize((W, H), Image.NEAREST)
+                    mask_image_tensor = mask_to_tensor(mask_img_resized).to(device=device, dtype=vae.dtype)  # [1,1,H,W]
+
+                    # (B) 라텐트 해상도 마스크
+                    #   라텐트 해상도는 VAE 다운샘플(보통 1/8)
+                    #   먼저 원본 라텐트 크기를 알아야 하므로 위에서 만든 latents 기반으로 크기 추출
+                    lat_h, lat_w = latents.shape[-2], latents.shape[-1]
                     mask_latent_img = mask_img_resized.resize((lat_w, lat_h), Image.NEAREST)
-                    mask_latent_tensor = mask_to_tensor(mask_latent_img)  # [1,1,latH,latW]
+                    mask_latent_tensor = mask_to_tensor(mask_latent_img).to(device=device, dtype=vae.dtype)  # [1,1,latH,latW]
+
+                    # (C) masked image 만들기 (픽셀 공간)
+                    #   구멍(hole)은 -1(정규화 공간에서 검정)로 채움.
+                    #   image_tensor: [1,1,C,H,W], mask_image_tensor: [1,1,H,W]
+                    hole = (-1.0) * mask_image_tensor  # [1,1,H,W]
+                    comp = image_tensor * (1.0 - mask_image_tensor) + hole  # 브로드캐스트로 채워짐
+
+                    with torch.no_grad():
+                        masked_post = vae.encode(comp).latent_dist
+                        masked_image_latents = masked_post.sample()
+                        masked_image_latents = (masked_image_latents - latents_mean) * latents_std
+                        masked_image_latents = masked_image_latents.to("cpu").contiguous()
 
                     mask_item = {
-                        "mask_image": mask_image_tensor.to("cpu").contiguous(),
-                        "mask_latent": mask_latent_tensor.to("cpu").contiguous(),
+                        "mask_image": mask_image_tensor.to("cpu").contiguous(),         # [1,1,H,W]
+                        "mask_latent": mask_latent_tensor.to("cpu").contiguous(),       # [1,1,h,w]
+                        "masked_image_latents": masked_image_latents,                   # [1,T,C,h,w]
                         "size": (W, H),
                     }
 
-                    if cfg.save_cache_on_disk and mask_cache_dir:
+                    if cfg.save_cache_on_disk:
                         torch.save(mask_item, os.path.join(mask_cache_dir, f"{stem}.pt"))
-                    # 메모리 캐시는 필요 시 확장
-                except Exception:
+                    # 필요시 메모리 캐시도 추가 가능
+
+                except Exception as e:
+                    # 마스크 처리 실패 시 건너뜀
                     pass
 
     return cached_img
