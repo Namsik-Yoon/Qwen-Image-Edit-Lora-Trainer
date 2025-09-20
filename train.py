@@ -39,6 +39,11 @@ import numpy as np
 from optimum.quanto import quantize, qfloat8, freeze
 import bitsandbytes as bnb
 logger = get_logger(__name__, log_level="INFO")
+logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
 from diffusers.loaders import AttnProcsLayers
 from diffusers import QwenImageEditPipeline
 import gc
@@ -501,10 +506,6 @@ def extract_green_mask_from_rgb(img_pil, down_h, down_w, blur_ks=11, blur_sigma=
 
 def main():
     args = OmegaConf.load(parse_args())
-    args.save_cache_on_disk = False
-    args.precompute_text_embeddings = True
-    args.precompute_image_embeddings = True
-
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     os.makedirs(logging_dir, exist_ok=True)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -520,35 +521,20 @@ def main():
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
     logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
-
-
-    if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-        args.mixed_precision = accelerator.mixed_precision
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-        args.mixed_precision = accelerator.mixed_precision
+    # if accelerator.is_local_main_process:
+    #     datasets.utils.logging.set_verbosity_warning()
+    #     transformers.utils.logging.set_verbosity_warning()
+    #     diffusers.utils.logging.set_verbosity_info()
+    # else:
+    #     datasets.utils.logging.set_verbosity_error()
+    #     transformers.utils.logging.set_verbosity_error()
+    #     diffusers.utils.logging.set_verbosity_error()
+    
+    if args.precompute_text_embeddings:
+        precompute_text_embeddings(args)
     text_encoding_pipeline = QwenImageEditPipeline.from_pretrained(
-        args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
+        args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=args.
     )
     text_encoding_pipeline.to(accelerator.device)
     cached_text_embeddings = None
